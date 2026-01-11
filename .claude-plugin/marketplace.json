@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "canxin-claude-plugins",
+  "version": "0.1.0",
+  "description": "Canxin Claude Code plugins",
+  "owner": {
+    "name": "canxin",
+    "email": "qq1969730106@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "planpilot",
+      "description": "Plan and track steps/goals with a local SQLite-backed CLI and Claude Code hooks. Use when the user asks to plan or break down work into steps/goals, track progress, manage plans, or mentions Planpilot/planpilot/plan pilot/计划/任务拆解/步骤/目标/进度.",
+      "version": "0.1.0",
+      "author": {
+        "name": "canxin",
+        "email": "qq1969730106@gmail.com"
+      },
+      "source": "./plugins/planpilot",
+      "category": "productivity",
+      "homepage": "https://github.com/canxin121/canxin-claude-plugins",
+      "license": "MIT"
+    }
+  ]
+}
