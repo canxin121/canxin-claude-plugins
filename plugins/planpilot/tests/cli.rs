@@ -1,3 +1,4 @@
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -9,6 +10,23 @@ use url::Url;
 
 fn bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_planpilot"))
+}
+
+fn append_history_entry(project: &Path, session_id: &str) {
+    let base = project.parent().unwrap_or(project);
+    let claude_home = base.join(".claude");
+    fs::create_dir_all(&claude_home).expect("create claude home");
+    let history_path = claude_home.join("history.jsonl");
+    let entry = serde_json::json!({
+        "project": project.to_string_lossy(),
+        "sessionId": session_id
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&history_path)
+        .expect("open history");
+    writeln!(file, "{}", entry).expect("write history");
 }
 
 fn run_cmd_with_env(
@@ -23,6 +41,28 @@ fn run_cmd_with_env(
     }
     if let Some(session_id) = session_id {
         cmd.arg("--session-id").arg(session_id);
+    }
+    let cwd_for_env = cwd.and_then(|path| {
+        let trimmed = path.as_os_str().to_string_lossy();
+        if trimmed.trim().is_empty() {
+            None
+        } else {
+            Some(path)
+        }
+    });
+    if let Some(cwd) = cwd_for_env {
+        let base = cwd.parent().unwrap_or(cwd);
+        let plugin_root = base.join(".claude").join("plugins").join("planpilot");
+        fs::create_dir_all(&plugin_root).expect("create plugin root");
+        cmd.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+        if let Some(session_id) = session_id {
+            append_history_entry(cwd, session_id);
+        }
+    } else {
+        let temp = TempDir::new().expect("temp plugin root");
+        let plugin_root = temp.path().join(".claude").join("plugins").join("planpilot");
+        fs::create_dir_all(&plugin_root).expect("create plugin root");
+        cmd.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
     }
     cmd.args(args);
     if input.is_some() {
@@ -75,9 +115,19 @@ fn parse_goal_id(stdout: &str) -> i64 {
     id_str.parse().expect("goal id parse")
 }
 
+fn project_dir(dir: &TempDir) -> PathBuf {
+    let path = dir.path().join("project");
+    fs::create_dir_all(&path).expect("create project dir");
+    path
+}
+
+fn claude_home(dir: &TempDir) -> PathBuf {
+    dir.path().join(".claude")
+}
+
 fn create_plan(dir: &TempDir) -> i64 {
     let stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(dir).as_path()),
         &["plan", "add", "Plan", "Content"],
         None,
     ));
@@ -91,13 +141,13 @@ fn add_step(dir: &TempDir, plan_id: i64, content: &str, executor: Option<&str>) 
         args.push("--executor");
         args.push(executor);
     }
-    let stdout = output_stdout(run_cmd(Some(dir.path()), &args, None));
+    let stdout = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &args, None));
     parse_step_id(&stdout)
 }
 
 fn add_goal(dir: &TempDir, step_id: i64, content: &str) -> i64 {
     let stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "add", &step_id.to_string(), content],
         None,
     ));
@@ -106,15 +156,14 @@ fn add_goal(dir: &TempDir, step_id: i64, content: &str) -> i64 {
 
 fn activate_plan(dir: &TempDir, plan_id: i64) {
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "activate", &plan_id.to_string()],
         None,
     ));
 }
 
 fn plan_md_path(dir: &TempDir, plan_id: i64) -> PathBuf {
-    dir.path()
-        .join(".claude")
+    claude_home(dir)
         .join(".planpilot")
         .join("plans")
         .join(format!("plan_{plan_id}.md"))
@@ -299,9 +348,14 @@ fn hook_stop_blocks_for_ai_step() {
 
     let payload = serde_json::json!({
         "session_id": "test-session",
-        "cwd": dir.path().to_string_lossy()
+        "cwd": project_dir(&dir).to_string_lossy()
     });
-    let output = run_cmd_with_env(None, None, &["hook", "stop"], Some(&payload.to_string()));
+    let output = run_cmd_with_env(
+        Some(project_dir(&dir).as_path()),
+        None,
+        &["hook", "stop"],
+        Some(&payload.to_string()),
+    );
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -320,27 +374,27 @@ fn hook_stop_blocks_for_ai_step() {
 fn list_count_only_outputs_total() {
     let dir = TempDir::new().expect("temp dir");
     let plan_stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "add", "Plan", "Content"],
         None,
     ));
     let plan_id = parse_plan_id(&plan_stdout);
 
     let step_stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "add", &plan_id.to_string(), "Step"],
         None,
     ));
     let step_id = parse_step_id(&step_stdout);
 
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "add", &step_id.to_string(), "Goal 1", "Goal 2"],
         None,
     ));
 
     let step_count = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "list", &plan_id.to_string(), "--count"],
         None,
     ));
@@ -348,7 +402,7 @@ fn list_count_only_outputs_total() {
     assert!(!step_count.contains("ID"));
 
     let goal_count = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "list", &step_id.to_string(), "--count"],
         None,
     ));
@@ -369,7 +423,7 @@ fn plan_md_created_and_updated() {
     assert!(contents.contains("**Active:** `true`"));
 
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "plan",
             "update",
@@ -394,7 +448,7 @@ fn plan_md_marked_inactive_on_deactivate() {
     let md_path = plan_md_path(&dir, plan_id);
     assert!(md_path.exists());
 
-    output_stdout(run_cmd(Some(dir.path()), &["plan", "deactivate"], None));
+    output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "deactivate"], None));
 
     let contents = std::fs::read_to_string(&md_path).expect("read plan.md");
     assert!(contents.contains("**Active:** `false`"));
@@ -404,7 +458,7 @@ fn plan_md_marked_inactive_on_deactivate() {
 fn plan_add_tree_creates_steps_and_goals() {
     let dir = TempDir::new().expect("temp dir");
     let stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "plan",
             "add-tree",
@@ -428,7 +482,7 @@ fn plan_add_tree_creates_steps_and_goals() {
     let plan_id = parse_plan_id(&stdout);
 
     let detail = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "show", &plan_id.to_string()],
         None,
     ));
@@ -442,7 +496,7 @@ fn plan_add_tree_creates_steps_and_goals() {
 fn plan_add_tree_rejects_json_step_spec() {
     let dir = TempDir::new().expect("temp dir");
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "plan",
             "add-tree",
@@ -462,7 +516,7 @@ fn plan_add_tree_rejects_json_step_spec() {
 fn plan_add_tree_rejects_empty_step_content() {
     let dir = TempDir::new().expect("temp dir");
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "add-tree", "Plan", "Content", "--step", "   "],
         None,
     );
@@ -475,7 +529,7 @@ fn plan_add_tree_rejects_empty_step_content() {
 fn plan_add_tree_rejects_empty_goal_content() {
     let dir = TempDir::new().expect("temp dir");
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "plan",
             "add-tree",
@@ -498,7 +552,7 @@ fn step_add_tree_creates_goals() {
     let dir = TempDir::new().expect("temp dir");
     let plan_id = create_plan(&dir);
     let stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "step",
             "add-tree",
@@ -516,7 +570,7 @@ fn step_add_tree_creates_goals() {
     let step_id = parse_step_id(&stdout);
 
     let goals = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "list", &step_id.to_string(), "--all"],
         None,
     ));
@@ -530,7 +584,7 @@ fn step_comment_rejects_empty_comment() {
     let plan_id = create_plan(&dir);
     let step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "comment", &step_id.to_string(), "   "],
         None,
     );
@@ -548,14 +602,14 @@ fn goal_done_multiple_ids_marks_all_done() {
     let g2 = add_goal(&dir, step_id, "G2");
 
     let output = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "done", &g1.to_string(), &g2.to_string()],
         None,
     ));
     assert!(output.contains("Goals marked done"));
 
     let goals = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "list", &step_id.to_string(), "--all"],
         None,
     ));
@@ -569,7 +623,7 @@ fn goal_comment_rejects_empty_comment() {
     let step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
     let goal_id = add_goal(&dir, step_id, "Goal 1");
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "comment", &goal_id.to_string(), "   "],
         None,
     );
@@ -587,14 +641,14 @@ fn step_done_all_goals_marks_goals_and_step() {
     let _g2 = add_goal(&dir, step_id, "G2");
 
     let output = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "done", &step_id.to_string(), "--all-goals"],
         None,
     ));
     assert!(output.contains("Step ID"));
 
     let goals = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "list", &step_id.to_string(), "--all"],
         None,
     ));
@@ -604,7 +658,7 @@ fn step_done_all_goals_marks_goals_and_step() {
 #[test]
 fn step_show_next_no_active_plan() {
     let dir = TempDir::new().expect("temp dir");
-    let output = output_stdout(run_cmd(Some(dir.path()), &["step", "show-next"], None));
+    let output = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["step", "show-next"], None));
     assert_eq!(output.trim(), "No active plan.");
 }
 
@@ -615,7 +669,7 @@ fn step_show_next_displays_detail() {
     let _step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
     activate_plan(&dir, plan_id);
 
-    let output = output_stdout(run_cmd(Some(dir.path()), &["step", "show-next"], None));
+    let output = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["step", "show-next"], None));
     assert!(output.contains("Step ID"));
     assert!(output.contains("Step 1"));
 }
@@ -628,7 +682,7 @@ fn step_done_with_next_ai_step_prompts_end_turn() {
     let _step2 = add_step(&dir, plan_id, "Step 2", Some("ai"));
 
     let output = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "done", &step1.to_string()],
         None,
     ));
@@ -644,7 +698,7 @@ fn goal_done_with_next_human_step_prints_detail() {
     let goal_id = add_goal(&dir, step1, "Goal 1");
 
     let output = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "done", &goal_id.to_string()],
         None,
     ));
@@ -662,7 +716,7 @@ fn plan_done_prompts_summary_and_end_turn() {
     let plan_id = create_plan(&dir);
 
     let output = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "done", &plan_id.to_string()],
         None,
     ));
@@ -677,7 +731,7 @@ fn plan_md_updates_on_step_add() {
     activate_plan(&dir, plan_id);
 
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "add", &plan_id.to_string(), "First step"],
         None,
     ));
@@ -696,7 +750,7 @@ fn plan_export_writes_markdown() {
 
     let export_path = dir.path().join("export.md");
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "plan",
             "export",
@@ -717,39 +771,140 @@ fn plan_export_writes_markdown() {
 fn plan_list_filters_status() {
     let dir = TempDir::new().expect("temp dir");
     let todo_stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "add", "Todo Plan", "Content"],
         None,
     ));
     let _todo_id = parse_plan_id(&todo_stdout);
 
     let done_stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "add", "Done Plan", "Content"],
         None,
     ));
     let done_id = parse_plan_id(&done_stdout);
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "done", &done_id.to_string()],
         None,
     ));
 
-    let stdout = output_stdout(run_cmd(Some(dir.path()), &["plan", "list"], None));
+    let stdout = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "list"], None));
     assert!(stdout.contains("Todo Plan"));
     assert!(!stdout.contains("Done Plan"));
 
-    let stdout_done = output_stdout(run_cmd(
-        Some(dir.path()),
-        &["plan", "list", "--status", "done"],
-        None,
-    ));
-    assert!(!stdout_done.contains("Todo Plan"));
-    assert!(stdout_done.contains("Done Plan"));
-
-    let stdout_all = output_stdout(run_cmd(Some(dir.path()), &["plan", "list", "--all"], None));
+    let stdout_all = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "list", "--all"], None));
     assert!(stdout_all.contains("Todo Plan"));
     assert!(stdout_all.contains("Done Plan"));
+}
+
+#[test]
+fn plan_list_includes_other_session_for_project() {
+    let dir = TempDir::new().expect("temp dir");
+    let cwd = project_dir(&dir);
+
+    output_stdout(run_cmd_with_env(
+        Some(cwd.as_path()),
+        Some("session-a"),
+        &["plan", "add", "Session A", "Content"],
+        None,
+    ));
+    output_stdout(run_cmd_with_env(
+        Some(cwd.as_path()),
+        Some("session-b"),
+        &["plan", "add", "Session B", "Content"],
+        None,
+    ));
+
+    let stdout = output_stdout(run_cmd_with_env(
+        Some(cwd.as_path()),
+        Some("session-a"),
+        &["plan", "list", "--project", "--all"],
+        None,
+    ));
+    assert!(stdout.contains("Session A"));
+    assert!(stdout.contains("Session B"));
+}
+
+#[test]
+fn plan_search_searches_steps() {
+    let dir = TempDir::new().expect("temp dir");
+    let plan_id = create_plan(&dir);
+    add_step(&dir, plan_id, "Needle Step", None);
+
+    let stdout = output_stdout(run_cmd(
+        Some(project_dir(&dir).as_path()),
+        &[
+            "plan",
+            "search",
+            "--search",
+            "needle",
+            "--search-field",
+            "steps",
+            "--all",
+        ],
+        None,
+    ));
+    assert!(stdout.contains("Plan"));
+
+    let stdout_none = output_stdout(run_cmd(
+        Some(project_dir(&dir).as_path()),
+        &[
+            "plan",
+            "search",
+            "--search",
+            "missing",
+            "--search-field",
+            "steps",
+            "--all",
+        ],
+        None,
+    ));
+    assert_eq!(stdout_none.trim(), "No plans found.");
+}
+
+#[test]
+fn plan_search_mode_any_matches_single_term() {
+    let dir = TempDir::new().expect("temp dir");
+    output_stdout(run_cmd(
+        Some(project_dir(&dir).as_path()),
+        &["plan", "add", "Alpha Plan", "Contains alpha"],
+        None,
+    ));
+
+    let stdout_any = output_stdout(run_cmd(
+        Some(project_dir(&dir).as_path()),
+        &[
+            "plan",
+            "search",
+            "--search",
+            "alpha",
+            "--search",
+            "missing",
+            "--search-mode",
+            "any",
+            "--all",
+        ],
+        None,
+    ));
+    assert!(stdout_any.contains("Alpha Plan"));
+
+    let stdout_all = output_stdout(run_cmd(
+        Some(project_dir(&dir).as_path()),
+        &[
+            "plan",
+            "search",
+            "--search",
+            "alpha",
+            "--search",
+            "missing",
+            "--search-mode",
+            "all",
+            "--all",
+        ],
+        None,
+    ));
+    assert_eq!(stdout_all.trim(), "No plans found.");
 }
 
 #[test]
@@ -759,7 +914,7 @@ fn plan_auto_done_prompts_summary_and_end_turn() {
     let step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
 
     let output = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "done", &step_id.to_string()],
         None,
     ));
@@ -773,7 +928,7 @@ fn step_add_rejects_empty_content() {
     let plan_id = create_plan(&dir);
 
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "add", &plan_id.to_string(), "   "],
         None,
     );
@@ -788,7 +943,7 @@ fn step_update_rejects_empty_content() {
     let plan_id = create_plan(&dir);
     let step_id = add_step(&dir, plan_id, "Step 1", None);
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "update", &step_id.to_string(), "--content", "   "],
         None,
     );
@@ -800,7 +955,7 @@ fn step_update_rejects_empty_content() {
 #[test]
 fn step_list_reports_missing_plan() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["step", "list", "9999"], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["step", "list", "9999"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.trim(), "Error: Not found: plan id 9999");
@@ -815,13 +970,13 @@ fn step_list_filters_status_and_executor() {
     let _charlie_id = add_step(&dir, plan_id, "Charlie", Some("human"));
 
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "done", &bravo_id.to_string()],
         None,
     ));
 
     let stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "step",
             "list",
@@ -841,7 +996,7 @@ fn step_list_filters_status_and_executor() {
 #[test]
 fn goal_list_reports_missing_step() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["goal", "list", "9999"], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["goal", "list", "9999"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.trim(), "Error: Not found: step id 9999");
@@ -851,20 +1006,20 @@ fn goal_list_reports_missing_step() {
 fn plan_activate_rejects_done_plan() {
     let dir = TempDir::new().expect("temp dir");
     let plan_stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "add", "Plan", "Content"],
         None,
     ));
     let plan_id = parse_plan_id(&plan_stdout);
 
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "done", &plan_id.to_string()],
         None,
     ));
 
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "activate", &plan_id.to_string()],
         None,
     );
@@ -876,7 +1031,7 @@ fn plan_activate_rejects_done_plan() {
 #[test]
 fn plan_activate_reports_missing_plan() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["plan", "activate", "9999"], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["plan", "activate", "9999"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.trim(), "Error: Not found: plan id 9999");
@@ -885,7 +1040,7 @@ fn plan_activate_reports_missing_plan() {
 #[test]
 fn step_remove_reports_missing_ids() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["step", "remove", "9999"], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["step", "remove", "9999"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -897,7 +1052,7 @@ fn step_remove_reports_missing_ids() {
 #[test]
 fn goal_remove_reports_missing_ids() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["goal", "remove", "9999"], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["goal", "remove", "9999"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -909,7 +1064,7 @@ fn goal_remove_reports_missing_ids() {
 #[test]
 fn plan_add_rejects_empty_content() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["plan", "add", "Plan", "   "], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["plan", "add", "Plan", "   "], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("plan content cannot be empty"));
@@ -918,7 +1073,7 @@ fn plan_add_rejects_empty_content() {
 #[test]
 fn plan_add_rejects_empty_title() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(Some(dir.path()), &["plan", "add", "   ", "Content"], None);
+    let output = run_cmd(Some(project_dir(&dir).as_path()), &["plan", "add", "   ", "Content"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("plan title cannot be empty"));
@@ -929,7 +1084,7 @@ fn plan_update_rejects_empty_content() {
     let dir = TempDir::new().expect("temp dir");
     let plan_id = create_plan(&dir);
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "update", &plan_id.to_string(), "--content", "   "],
         None,
     );
@@ -943,7 +1098,7 @@ fn plan_update_rejects_empty_title() {
     let dir = TempDir::new().expect("temp dir");
     let plan_id = create_plan(&dir);
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["plan", "update", &plan_id.to_string(), "--title", "   "],
         None,
     );
@@ -958,7 +1113,7 @@ fn goal_add_rejects_empty_content() {
     let plan_id = create_plan(&dir);
     let step_id = add_step(&dir, plan_id, "Step 1", None);
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "add", &step_id.to_string(), "   "],
         None,
     );
@@ -974,7 +1129,7 @@ fn goal_update_rejects_empty_content() {
     let step_id = add_step(&dir, plan_id, "Step 1", None);
     let goal_id = add_goal(&dir, step_id, "Goal 1");
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "update", &goal_id.to_string(), "--content", "   "],
         None,
     );
@@ -993,13 +1148,13 @@ fn goal_list_filters_status_and_pagination() {
     let _goal3 = add_goal(&dir, step_id, "G3");
 
     output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "done", &goal2.to_string()],
         None,
     ));
 
     let stdout_done = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "list", &step_id.to_string(), "--status", "done"],
         None,
     ));
@@ -1008,7 +1163,7 @@ fn goal_list_filters_status_and_pagination() {
     assert!(!stdout_done.contains("G3"));
 
     let stdout_page = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &[
             "goal",
             "list",
@@ -1034,7 +1189,7 @@ fn goal_show_outputs_detail() {
     let goal_id = add_goal(&dir, step_id, "Goal 1");
 
     let stdout = output_stdout(run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["goal", "show", &goal_id.to_string()],
         None,
     ));
@@ -1052,7 +1207,7 @@ fn step_add_rejects_zero_position() {
     let dir = TempDir::new().expect("temp dir");
     let plan_id = create_plan(&dir);
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "add", &plan_id.to_string(), "Step", "--at", "0"],
         None,
     );
@@ -1067,7 +1222,7 @@ fn step_move_rejects_zero_position() {
     let plan_id = create_plan(&dir);
     let step_id = add_step(&dir, plan_id, "Step 1", None);
     let output = run_cmd(
-        Some(dir.path()),
+        Some(project_dir(&dir).as_path()),
         &["step", "move", &step_id.to_string(), "--to", "0"],
         None,
     );
@@ -1079,7 +1234,7 @@ fn step_move_rejects_zero_position() {
 #[test]
 fn plan_show_active_when_none() {
     let dir = TempDir::new().expect("temp dir");
-    let stdout = output_stdout(run_cmd(Some(dir.path()), &["plan", "show-active"], None));
+    let stdout = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "show-active"], None));
     assert_eq!(stdout.trim(), "No active plan.");
 }
 
@@ -1089,9 +1244,9 @@ fn plan_deactivate_clears_active() {
     let plan_id = create_plan(&dir);
     activate_plan(&dir, plan_id);
 
-    output_stdout(run_cmd(Some(dir.path()), &["plan", "deactivate"], None));
+    output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "deactivate"], None));
 
-    let stdout = output_stdout(run_cmd(Some(dir.path()), &["plan", "show-active"], None));
+    let stdout = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "show-active"], None));
     assert_eq!(stdout.trim(), "No active plan.");
 }
 
@@ -1119,7 +1274,7 @@ fn empty_cwd_flag_errors() {
 #[test]
 fn missing_session_id_flag_errors() {
     let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd_with_env(Some(dir.path()), None, &["plan", "list"], None);
+    let output = run_cmd_with_env(Some(project_dir(&dir).as_path()), None, &["plan", "list"], None);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--session-id"));
@@ -1131,9 +1286,7 @@ async fn show_active_clears_orphaned_active_plan() {
     let plan_id = create_plan(&dir);
     activate_plan(&dir, plan_id);
 
-    let db_path = dir
-        .path()
-        .join(".claude")
+    let db_path = claude_home(&dir)
         .join(".planpilot")
         .join("planpilot.db");
     let mut url = Url::from_file_path(&db_path).expect("db path");
@@ -1154,9 +1307,9 @@ async fn show_active_clears_orphaned_active_plan() {
     .await
     .expect("update active plan");
 
-    let stdout = output_stdout(run_cmd(Some(dir.path()), &["plan", "show-active"], None));
+    let stdout = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "show-active"], None));
     assert!(stdout.contains(&format!("Active plan ID: {} not found.", invalid_id)));
 
-    let stdout = output_stdout(run_cmd(Some(dir.path()), &["plan", "show-active"], None));
+    let stdout = output_stdout(run_cmd(Some(project_dir(&dir).as_path()), &["plan", "show-active"], None));
     assert_eq!(stdout.trim(), "No active plan.");
 }

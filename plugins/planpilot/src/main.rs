@@ -9,21 +9,25 @@ mod util;
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
+use clap::parser::ValueSource;
+use serde::Deserialize;
 
 use crate::app::{App, StatusChanges, StepInput};
 use crate::cli::{
     Cli, Command, GoalAdd, GoalCommand, GoalComment, GoalDone, GoalList, GoalRemove, GoalShow,
     GoalStatusArg, GoalUpdate, HookCommand, PlanActivate, PlanAdd, PlanAddTree, PlanCommand,
-    PlanComment, PlanDone, PlanExport, PlanList, PlanOrderArg, PlanRemove, PlanShow, PlanStatusArg,
-    PlanUpdate, StepAdd, StepAddTree, StepCommand, StepComment, StepDone, StepExecutorArg, StepList,
-    StepMove, StepOrderArg, StepRemove, StepShow, StepSpec, StepStatusArg, StepUpdate,
+    PlanComment, PlanDone, PlanExport, PlanList, PlanRemove, PlanSearch,
+    PlanSearchFieldArg, PlanSearchModeArg, PlanShow, PlanStatusArg, PlanUpdate, StepAdd,
+    StepAddTree, StepCommand, StepComment, StepDone, StepExecutorArg, StepList, StepMove,
+    StepOrderArg, StepRemove, StepShow, StepSpec, StepStatusArg, StepUpdate,
 };
 use crate::error::AppError;
 use crate::model::{
-    GoalChanges, GoalQuery, GoalStatus, PlanChanges, PlanInput, PlanOrder, PlanStatus, StepChanges,
+    GoalChanges, GoalQuery, GoalStatus, PlanChanges, PlanInput, PlanStatus, StepChanges,
     StepExecutor, StepOrder, StepQuery, StepStatus,
 };
 use crate::util::{
@@ -32,6 +36,7 @@ use crate::util::{
 
 const CWD_FLAG: &str = "--cwd";
 const SESSION_ID_FLAG: &str = "--session-id";
+const CLAUDE_PLUGIN_ROOT_ENV: &str = "CLAUDE_PLUGIN_ROOT";
 
 #[tokio::main]
 async fn main() {
@@ -42,11 +47,14 @@ async fn main() {
 }
 
 async fn run() -> Result<(), AppError> {
+    let matches = Cli::command().get_matches();
+    let cwd_flag_present = matches.value_source("cwd") == Some(ValueSource::CommandLine);
     let Cli {
         command,
         cwd,
         session_id,
-    } = Cli::parse();
+    } = Cli::from_arg_matches(&matches)
+        .map_err(|err| AppError::InvalidInput(err.to_string()))?;
 
     match command {
         Command::Hook(command) => {
@@ -54,9 +62,9 @@ async fn run() -> Result<(), AppError> {
             return Ok(());
         }
         command => {
-            let project_dir = resolve_cwd(cwd)?;
             let session_id = resolve_session_id(session_id)?;
-            let db_path = db::resolve_db_path(&project_dir);
+            let claude_home = resolve_claude_home()?;
+            let db_path = db::resolve_db_path(&claude_home);
             db::ensure_parent_dir(&db_path)?;
             let mut lock = db::open_lock(&db_path)?;
             let _guard = lock.write()?;
@@ -78,9 +86,27 @@ async fn run() -> Result<(), AppError> {
                             | PlanCommand::Activate(_)
                             | PlanCommand::Deactivate(_)
                     );
-                    let plan_ids = handle_plan(&app, command).await?;
+                    let plan_ids = match command {
+                        PlanCommand::List(args) => {
+                            let context = PlanListContext {
+                                cwd: cwd.as_deref(),
+                                claude_home: &claude_home,
+                                cwd_flag_present,
+                            };
+                            handle_plan_list(&app, args, &context).await?
+                        }
+                        PlanCommand::Search(args) => {
+                            let context = PlanListContext {
+                                cwd: cwd.as_deref(),
+                                claude_home: &claude_home,
+                                cwd_flag_present,
+                            };
+                            handle_plan_search(&app, args, &context).await?
+                        }
+                        command => handle_plan(&app, command).await?,
+                    };
                     if should_sync {
-                        sync_plan_md(&project_dir, &app, &plan_ids).await?;
+                        sync_plan_md(&claude_home, &app, &plan_ids).await?;
                     }
                 }
                 Command::Step(command) => {
@@ -96,7 +122,7 @@ async fn run() -> Result<(), AppError> {
                     );
                     let plan_ids = handle_step(&app, command).await?;
                     if should_sync {
-                        sync_plan_md(&project_dir, &app, &plan_ids).await?;
+                        sync_plan_md(&claude_home, &app, &plan_ids).await?;
                     }
                 }
                 Command::Goal(command) => {
@@ -110,7 +136,7 @@ async fn run() -> Result<(), AppError> {
                     );
                     let plan_ids = handle_goal(&app, command).await?;
                     if should_sync {
-                        sync_plan_md(&project_dir, &app, &plan_ids).await?;
+                        sync_plan_md(&claude_home, &app, &plan_ids).await?;
                     }
                 }
                 Command::Hook(_) => {}
@@ -132,7 +158,12 @@ async fn handle_plan(app: &App, command: PlanCommand) -> Result<Vec<i64>, AppErr
     match command {
         PlanCommand::Add(args) => handle_plan_add(app, args).await,
         PlanCommand::AddTree(args) => handle_plan_add_tree(app, args).await,
-        PlanCommand::List(args) => handle_plan_list(app, args).await,
+        PlanCommand::List(_) => Err(AppError::InvalidInput(
+            "plan list must be handled with list context".to_string(),
+        )),
+        PlanCommand::Search(_) => Err(AppError::InvalidInput(
+            "plan search must be handled with list context".to_string(),
+        )),
         PlanCommand::Show(args) => handle_plan_show(app, args).await,
         PlanCommand::Export(args) => handle_plan_export(app, args).await,
         PlanCommand::Comment(args) => handle_plan_comment(app, args).await,
@@ -233,23 +264,32 @@ async fn handle_plan_add_tree(app: &App, args: PlanAddTree) -> Result<Vec<i64>, 
     Ok(vec![plan.id])
 }
 
-async fn handle_plan_list(app: &App, args: PlanList) -> Result<Vec<i64>, AppError> {
-    let desired = if args.all {
+struct PlanListContext<'a> {
+    cwd: Option<&'a Path>,
+    claude_home: &'a Path,
+    cwd_flag_present: bool,
+}
+
+async fn handle_plan_list(
+    app: &App,
+    args: PlanList,
+    context: &PlanListContext<'_>,
+) -> Result<Vec<i64>, AppError> {
+    let PlanList { all, project } = args;
+    let desired = if all {
         None
-    } else if let Some(status) = args.status {
-        Some(plan_status_from_arg(status))
     } else {
         Some(PlanStatus::Todo)
     };
 
-    let order = args.order.map(plan_order_from_arg);
-    let plans = app.list_plans(order, args.desc).await?;
+    let cwd = require_cwd(context)?;
+    let plans = app.list_plans(None, false).await?;
     if plans.is_empty() {
         println!("No plans found.");
         return Ok(Vec::new());
     }
 
-    let filtered: Vec<_> = plans
+    let mut filtered: Vec<_> = plans
         .into_iter()
         .filter(|plan| match desired {
             None => true,
@@ -257,12 +297,87 @@ async fn handle_plan_list(app: &App, args: PlanList) -> Result<Vec<i64>, AppErro
         })
         .collect();
 
+    if project {
+        let session_ids = collect_session_ids_for_project(context.claude_home, &cwd)?;
+        filtered.retain(|plan| {
+            plan.last_session_id
+                .as_ref()
+                .is_some_and(|id| session_ids.contains(id))
+        });
+    }
+
     if filtered.is_empty() {
         println!("No plans found.");
         return Ok(Vec::new());
     }
 
     let details = app.get_plan_details(&filtered).await?;
+    print_plan_list(&details);
+    Ok(Vec::new())
+}
+
+async fn handle_plan_search(
+    app: &App,
+    args: PlanSearch,
+    context: &PlanListContext<'_>,
+) -> Result<Vec<i64>, AppError> {
+    let PlanSearch {
+        all,
+        project,
+        search,
+        search_mode,
+        search_field,
+        match_case,
+    } = args;
+    let desired = if all {
+        None
+    } else {
+        Some(PlanStatus::Todo)
+    };
+
+    let cwd = require_cwd(context)?;
+    let plans = app.list_plans(None, false).await?;
+    if plans.is_empty() {
+        println!("No plans found.");
+        return Ok(Vec::new());
+    }
+
+    let mut filtered: Vec<_> = plans
+        .into_iter()
+        .filter(|plan| match desired {
+            None => true,
+            Some(status) => plan.status == status.as_str(),
+        })
+        .collect();
+
+    if project {
+        let session_ids = collect_session_ids_for_project(context.claude_home, &cwd)?;
+        filtered.retain(|plan| {
+            plan.last_session_id
+                .as_ref()
+                .is_some_and(|id| session_ids.contains(id))
+        });
+    }
+
+    if filtered.is_empty() {
+        println!("No plans found.");
+        return Ok(Vec::new());
+    }
+
+    let mut details = app.get_plan_details(&filtered).await?;
+    let search = PlanSearchQuery::new(search, search_mode, search_field, match_case);
+    if !search.has_terms() {
+        return Err(AppError::InvalidInput(
+            "plan search requires at least one --search".to_string(),
+        ));
+    }
+    details.retain(|detail| plan_matches_search(detail, &search));
+
+    if details.is_empty() {
+        println!("No plans found.");
+        return Ok(Vec::new());
+    }
+
     print_plan_list(&details);
     Ok(Vec::new())
 }
@@ -732,7 +847,7 @@ async fn handle_goal_remove(app: &App, args: GoalRemove) -> Result<Vec<i64>, App
     Ok(plan_ids)
 }
 
-async fn sync_plan_md(project_dir: &Path, app: &App, plan_ids: &[i64]) -> Result<(), AppError> {
+async fn sync_plan_md(claude_home: &Path, app: &App, plan_ids: &[i64]) -> Result<(), AppError> {
     if plan_ids.is_empty() {
         return Ok(());
     }
@@ -756,7 +871,7 @@ async fn sync_plan_md(project_dir: &Path, app: &App, plan_ids: &[i64]) -> Result
 
         let is_active = active_id == Some(*plan_id);
         let activated_at = if is_active { active_updated } else { None };
-        let md_path = db::resolve_plan_md_path(project_dir, *plan_id);
+        let md_path = db::resolve_plan_md_path(claude_home, *plan_id);
         db::ensure_parent_dir(&md_path)?;
         let markdown = format_plan_markdown(
             is_active,
@@ -769,6 +884,218 @@ async fn sync_plan_md(project_dir: &Path, app: &App, plan_ids: &[i64]) -> Result
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryEntry {
+    project: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PlanSearchQuery {
+    terms: Vec<String>,
+    mode: PlanSearchModeArg,
+    field: PlanSearchFieldArg,
+    match_case: bool,
+}
+
+impl PlanSearchQuery {
+    fn new(
+        raw_terms: Vec<String>,
+        search_mode: Option<PlanSearchModeArg>,
+        search_field: Option<PlanSearchFieldArg>,
+        match_case: bool,
+    ) -> Self {
+        let mut terms: Vec<String> = raw_terms
+            .into_iter()
+            .map(|term| term.trim().to_string())
+            .filter(|term| !term.is_empty())
+            .collect();
+        if !match_case {
+            terms = terms.into_iter().map(|term| term.to_lowercase()).collect();
+        }
+        PlanSearchQuery {
+            terms,
+            mode: search_mode.unwrap_or(PlanSearchModeArg::All),
+            field: search_field.unwrap_or(PlanSearchFieldArg::Plan),
+            match_case,
+        }
+    }
+
+    fn has_terms(&self) -> bool {
+        !self.terms.is_empty()
+    }
+}
+
+fn plan_matches_search(detail: &crate::app::PlanDetail, search: &PlanSearchQuery) -> bool {
+    let mut haystacks: Vec<String> = Vec::new();
+    let add_value = |haystacks: &mut Vec<String>, value: &str, match_case: bool| {
+        if match_case {
+            haystacks.push(value.to_string());
+        } else {
+            haystacks.push(value.to_lowercase());
+        }
+    };
+
+    let include_plan = matches!(
+        search.field,
+        PlanSearchFieldArg::Plan | PlanSearchFieldArg::All
+    );
+    let include_title = matches!(
+        search.field,
+        PlanSearchFieldArg::Title | PlanSearchFieldArg::Plan | PlanSearchFieldArg::All
+    );
+    let include_content = matches!(
+        search.field,
+        PlanSearchFieldArg::Content | PlanSearchFieldArg::Plan | PlanSearchFieldArg::All
+    );
+    let include_comment = matches!(
+        search.field,
+        PlanSearchFieldArg::Comment | PlanSearchFieldArg::Plan | PlanSearchFieldArg::All
+    );
+    let include_steps = matches!(search.field, PlanSearchFieldArg::Steps | PlanSearchFieldArg::All);
+    let include_goals = matches!(search.field, PlanSearchFieldArg::Goals | PlanSearchFieldArg::All);
+
+    if include_plan || include_title {
+        add_value(&mut haystacks, &detail.plan.title, search.match_case);
+    }
+    if include_plan || include_content {
+        add_value(&mut haystacks, &detail.plan.content, search.match_case);
+    }
+    if include_plan || include_comment {
+        if let Some(comment) = detail.plan.comment.as_deref() {
+            add_value(&mut haystacks, comment, search.match_case);
+        }
+    }
+    if include_steps {
+        for step in &detail.steps {
+            add_value(&mut haystacks, &step.content, search.match_case);
+        }
+    }
+    if include_goals {
+        for goals in detail.goals.values() {
+            for goal in goals {
+                add_value(&mut haystacks, &goal.content, search.match_case);
+            }
+        }
+    }
+
+    if haystacks.is_empty() {
+        return false;
+    }
+
+    match search.mode {
+        PlanSearchModeArg::Any => search
+            .terms
+            .iter()
+            .any(|term| haystacks.iter().any(|value| value.contains(term))),
+        PlanSearchModeArg::All => search
+            .terms
+            .iter()
+            .all(|term| haystacks.iter().any(|value| value.contains(term))),
+    }
+}
+
+fn collect_session_ids_for_project(
+    claude_home: &Path,
+    project: &Path,
+) -> Result<HashSet<String>, AppError> {
+    let history_path = claude_home.join("history.jsonl");
+    let file = match fs::File::open(&history_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let canonical = fs::canonicalize(project).ok();
+    let project_raw = project.to_string_lossy().to_string();
+    let project_canonical = canonical
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let mut sessions = HashSet::new();
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: HistoryEntry = match serde_json::from_str(&line) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(project) = entry.project else { continue };
+        if project_matches_path(&project, &project_raw, project_canonical.as_deref()) {
+            if let Some(session_id) = entry.session_id {
+                sessions.insert(session_id);
+            }
+        }
+    }
+
+    Ok(sessions)
+}
+
+fn project_matches_path(project: &str, path_raw: &str, path_canonical: Option<&str>) -> bool {
+    if project == path_raw {
+        return true;
+    }
+    if let Some(canonical) = path_canonical {
+        if project == canonical {
+            return true;
+        }
+        if canonical.starts_with(&format!("{project}/")) {
+            return true;
+        }
+    }
+    if path_raw.starts_with(&format!("{project}/")) {
+        return true;
+    }
+    false
+}
+
+fn resolve_claude_home() -> Result<PathBuf, AppError> {
+    if let Ok(plugin_root) = std::env::var(CLAUDE_PLUGIN_ROOT_ENV) {
+        if let Some(home) = find_claude_home(Path::new(&plugin_root)) {
+            return Ok(home);
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(home) = find_claude_home(&exe_path) {
+            return Ok(home);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = PathBuf::from(home).join(".claude");
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(AppError::InvalidInput(
+        "unable to resolve Claude home; set CLAUDE_PLUGIN_ROOT".to_string(),
+    ))
+}
+
+fn find_claude_home(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(path) = current {
+        if path.file_name().is_some_and(|name| name == ".claude") {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+fn require_cwd(context: &PlanListContext<'_>) -> Result<PathBuf, AppError> {
+    if !context.cwd_flag_present {
+        return Err(AppError::InvalidInput(format!("{CWD_FLAG} is required")));
+    }
+    resolve_cwd(context.cwd.map(|path| path.to_path_buf()))
 }
 
 fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, AppError> {
@@ -980,15 +1307,6 @@ fn goal_status_from_arg(arg: GoalStatusArg) -> GoalStatus {
     match arg {
         GoalStatusArg::Todo => GoalStatus::Todo,
         GoalStatusArg::Done => GoalStatus::Done,
-    }
-}
-
-fn plan_order_from_arg(arg: PlanOrderArg) -> PlanOrder {
-    match arg {
-        PlanOrderArg::Id => PlanOrder::Id,
-        PlanOrderArg::Title => PlanOrder::Title,
-        PlanOrderArg::Created => PlanOrder::Created,
-        PlanOrderArg::Updated => PlanOrder::Updated,
     }
 }
 

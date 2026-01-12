@@ -14,14 +14,14 @@ pub struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Project root directory (required)"
+        help = "Current working directory (used for plan list scoping)"
     )]
     pub cwd: Option<PathBuf>,
     #[arg(
         long,
         global = true,
         value_name = "ID",
-        help = "Session identifier (required)"
+        help = "Session identifier"
     )]
     pub session_id: Option<String>,
     #[command(subcommand)]
@@ -46,6 +46,7 @@ pub enum PlanCommand {
     #[command(name = "add-tree")]
     AddTree(PlanAddTree),
     List(PlanList),
+    Search(PlanSearch),
     Show(PlanShow),
     Export(PlanExport),
     Comment(PlanComment),
@@ -123,12 +124,24 @@ pub struct StepSpec {
 pub struct PlanList {
     #[arg(long)]
     pub all: bool,
-    #[arg(long, value_enum)]
-    pub status: Option<PlanStatusArg>,
-    #[arg(long, value_enum)]
-    pub order: Option<PlanOrderArg>,
     #[arg(long)]
-    pub desc: bool,
+    pub project: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PlanSearch {
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub project: bool,
+    #[arg(long, value_name = "TERM")]
+    pub search: Vec<String>,
+    #[arg(long, value_enum)]
+    pub search_mode: Option<PlanSearchModeArg>,
+    #[arg(long, value_enum)]
+    pub search_field: Option<PlanSearchFieldArg>,
+    #[arg(long)]
+    pub match_case: bool,
 }
 
 #[derive(Args, Debug)]
@@ -339,6 +352,23 @@ pub enum PlanStatusArg {
 }
 
 #[derive(ValueEnum, Clone, Debug)]
+pub enum PlanSearchModeArg {
+    Any,
+    All,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+pub enum PlanSearchFieldArg {
+    Plan,
+    Title,
+    Content,
+    Comment,
+    Steps,
+    Goals,
+    All,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
 pub enum StepStatusArg {
     Todo,
     Done,
@@ -354,14 +384,6 @@ pub enum StepExecutorArg {
 pub enum GoalStatusArg {
     Todo,
     Done,
-}
-
-#[derive(ValueEnum, Clone, Debug)]
-pub enum PlanOrderArg {
-    Id,
-    Title,
-    Created,
-    Updated,
 }
 
 #[derive(ValueEnum, Clone, Debug)]

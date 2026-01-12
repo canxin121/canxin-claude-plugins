@@ -8,20 +8,20 @@ use url::Url;
 use crate::entities::{active_plan, goal, plan, step};
 use crate::error::AppError;
 
-pub fn resolve_db_path(project_dir: &Path) -> PathBuf {
-    resolve_planpilot_dir(project_dir).join("planpilot.db")
+pub fn resolve_db_path(claude_home: &Path) -> PathBuf {
+    resolve_planpilot_dir(claude_home).join("planpilot.db")
 }
 
-pub fn resolve_planpilot_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".claude").join(".planpilot")
+pub fn resolve_planpilot_dir(claude_home: &Path) -> PathBuf {
+    claude_home.join(".planpilot")
 }
 
-pub fn resolve_plan_md_dir(project_dir: &Path) -> PathBuf {
-    resolve_planpilot_dir(project_dir).join("plans")
+pub fn resolve_plan_md_dir(claude_home: &Path) -> PathBuf {
+    resolve_planpilot_dir(claude_home).join("plans")
 }
 
-pub fn resolve_plan_md_path(project_dir: &Path, plan_id: i64) -> PathBuf {
-    resolve_plan_md_dir(project_dir).join(format!("plan_{plan_id}.md"))
+pub fn resolve_plan_md_path(claude_home: &Path, plan_id: i64) -> PathBuf {
+    resolve_plan_md_dir(claude_home).join(format!("plan_{plan_id}.md"))
 }
 
 pub fn ensure_parent_dir(path: &Path) -> Result<(), AppError> {

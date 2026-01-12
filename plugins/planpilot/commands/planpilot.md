@@ -11,7 +11,7 @@ allowed-tools: ["Bash(planpilot:*)"]
 `planpilot`
 
 ## Database location:
-`<project>/.claude/.planpilot/planpilot.db`
+`~/.claude/.planpilot/planpilot.db`
 
 ## Hierarchy
 - Plan contains steps; step contains goals.
@@ -55,6 +55,7 @@ allowed-tools: ["Bash(planpilot:*)"]
 
 ### plan
 - IMPORTANT: The AI must NOT pass `--cwd` or `--session-id` manually. These are auto-injected by the hook; passing them will conflict with the injected values.
+- Plan data is stored under Claude home: `~/.claude/.planpilot/` (derived from the plugin directory).
 - `plan add <title> <content>`: create a plan.
   - Output: `Created plan ID: <id>: <title>`.
 - `plan add-tree <title> <content> --step <content> [--executor ai|human] [--goal <goal> ...] [--step <content> ...]`: create a plan with steps/goals in one command.
@@ -74,9 +75,21 @@ allowed-tools: ["Bash(planpilot:*)"]
       --step "Install tooling" --executor ai \
       --step "Read handbook"
     ```
-- `plan list [--all] [--status todo|done] [--order id|title|created|updated] [--desc]`: list plans (defaults to `todo` unless `--all` or `--status` is set).
+- `plan list [--all] [--project]`: list plans (defaults to `todo` unless `--all` is set). Use `--project` to limit to the current cwd project.
   - Output: prints a header line, then one line per plan with `ID STAT STEPS TITLE COMMENT` (`STEPS` is `done/total`); use `plan show` for full details.
   - Output (empty): `No plans found.`
+- `plan search --search <term> [--search <term> ...] [--search-mode any|all] [--search-field plan|title|content|comment|steps|goals|all] [--match-case] [--all] [--project]`: search plans. Use `--project` to limit to the current cwd project.
+  - Output: same format as `plan list`.
+  - Output (empty): `No plans found.`
+  - Scope flags:
+    - `--scope cwd`: show plans whose `last_session_id` belongs to sessions for the current cwd (default).
+    - `--scope session`: show plans for the current session only.
+    - `--scope all`: show all plans across sessions.
+  - Advanced search:
+    - `--search <term>` (repeatable): filter plans by text.
+    - `--search-mode any|all`: match any term or require all terms (default: `all`).
+    - `--search-field plan|title|content|comment|steps|goals|all` (default: `plan`).
+    - `--match-case`: make search case-sensitive.
 - `plan show <id>`: prints plan details and nested steps/goals (includes ids for plan/step/goal).
   - Output: plan header includes `Plan ID: <id>`, `Title`, `Status`, `Content`, `Created`, `Updated`, and `Comment` when present.
   - Output: each step line includes step id and executor; progress (`goals done/total`) is shown only when the step has goals. Each goal line includes goal id.

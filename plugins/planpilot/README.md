@@ -5,7 +5,7 @@ Planpilot is a Claude Code plugin that keeps multi-step work moving. When the AI
 ## Features
 - Stop-hook instructs the AI to continue with the next pending step.
 - Plan/step/goal hierarchy with automatic status rollups.
-- Local-first storage per workspace (SQLite + readable plan snapshots).
+- Local-first storage under Claude home (SQLite + readable plan snapshots).
 - Claude Code hook injects required context flags for planpilot CLI calls.
 
 ## Requirements
