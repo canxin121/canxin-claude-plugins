@@ -16,11 +16,9 @@ if [ "$tool_name" != "Bash" ]; then
 fi
 
 command="$(jq -r '.tool_input.command // empty' <<<"$payload")"
-trimmed="${command#"${command%%[![:space:]]*}"}"
-case "$trimmed" in
-  planpilot\ *) ;;
-  *) exit 0 ;;
-esac
+if [[ "$command" != *planpilot* ]]; then
+  exit 0
+fi
 
 if ! command -v planpilot >/dev/null 2>&1; then
   exit 0

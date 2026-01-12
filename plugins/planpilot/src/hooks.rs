@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use serde_json::json;
 use shell_escape::escape;
-use shlex::Shlex;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::Command;
@@ -178,7 +177,7 @@ fn extract_executor(output: &str) -> Option<String> {
 }
 
 fn command_matches(command: &str) -> bool {
-    command.trim_start().starts_with("planpilot ")
+    find_planpilot_insertion(command).is_some()
 }
 
 fn inject_flags(command: &str, cwd: &str, session_id: &str) -> String {
@@ -186,39 +185,124 @@ fn inject_flags(command: &str, cwd: &str, session_id: &str) -> String {
         return command.to_string();
     }
 
-    let trimmed = command.trim_start();
-    if trimmed.is_empty() {
-        return command.to_string();
-    }
-
-    let leading_len = command.len() - trimmed.len();
-    let mut lexer = Shlex::new(trimmed);
-    let first = match lexer.next() {
-        Some(token) => token,
+    let insert_at = match find_planpilot_insertion(command) {
+        Some(position) => position,
         None => return command.to_string(),
     };
-    if first != "planpilot" {
-        return command.to_string();
-    }
 
-    let rest = lexer
-        .collect::<Vec<String>>()
-        .into_iter()
-        .map(|token| escape(token.into()).to_string())
-        .collect::<Vec<String>>()
-        .join(" ");
     let mut updated = String::new();
-    updated.push_str(&command[..leading_len]);
-    updated.push_str(&first);
+    updated.push_str(&command[..insert_at]);
     updated.push_str(" --cwd ");
     updated.push_str(&escape(cwd.into()));
     updated.push_str(" --session-id ");
     updated.push_str(&escape(session_id.into()));
-    if !rest.is_empty() {
-        updated.push(' ');
-        updated.push_str(&rest);
-    }
+    updated.push_str(&command[insert_at..]);
     updated
+}
+
+fn find_planpilot_insertion(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let word = b"planpilot";
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape_next = false;
+    let mut at_command_start = true;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if escape_next {
+            escape_next = false;
+            at_command_start = false;
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            match b {
+                b'"' => {
+                    in_double = false;
+                    i += 1;
+                    continue;
+                }
+                b'\\' => {
+                    escape_next = true;
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        match b {
+            b'\\' => {
+                escape_next = true;
+                i += 1;
+                continue;
+            }
+            b'\'' => {
+                in_single = true;
+                i += 1;
+                continue;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if b.is_ascii_whitespace() {
+            if matches!(b, b'\n' | b'\r') {
+                at_command_start = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if is_separator(b) {
+            at_command_start = true;
+            i += 1;
+            continue;
+        }
+
+        if at_command_start && bytes[i..].starts_with(word) {
+            let after = i + word.len();
+            if after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                let next_non_ws = bytes[after..]
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace());
+                if let Some(offset) = next_non_ws {
+                    let next_char = bytes[after + offset];
+                    if !is_separator(next_char) {
+                        return Some(after);
+                    }
+                }
+            }
+        }
+
+        at_command_start = false;
+        i += 1;
+    }
+
+    None
+}
+
+fn is_separator(byte: u8) -> bool {
+    matches!(byte, b'&' | b'|' | b';')
 }
 
 fn print_approve() {
@@ -240,15 +324,49 @@ mod tests {
     fn command_matches_requires_planpilot_space_prefix() {
         assert!(command_matches("planpilot step show-next"));
         assert!(command_matches("  planpilot step show-next"));
+        assert!(command_matches("cd /tmp && planpilot step show-next"));
+        assert!(command_matches("cd /tmp&&planpilot step show-next"));
+        assert!(command_matches("planpilot\tstep show-next"));
+        assert!(command_matches("echo hi | planpilot step show-next"));
+        assert!(command_matches("pwd;planpilot step show-next"));
         assert!(!command_matches("planpilot"));
+        assert!(!command_matches("planpilot && echo hi"));
+        assert!(!command_matches("planpilot;echo hi"));
         assert!(!command_matches("planpilot.sh step"));
         assert!(!command_matches("echo planpilot step"));
+        assert!(!command_matches("echo 'planpilot step show-next'"));
+        assert!(!command_matches("echo \"planpilot step show-next\""));
     }
 
     #[test]
     fn inject_flags_preserves_leading_whitespace() {
         let updated = inject_flags("  planpilot step show-next", "/tmp", "abc");
         assert!(updated.starts_with("  planpilot --cwd /tmp --session-id abc"));
+    }
+
+    #[test]
+    fn inject_flags_inserts_after_chained_planpilot() {
+        let updated = inject_flags("cd /tmp&&planpilot step show-next", "/tmp", "abc");
+        assert!(
+            updated.starts_with("cd /tmp&&planpilot --cwd /tmp --session-id abc"),
+            "command: {updated}"
+        );
+    }
+
+    #[test]
+    fn inject_flags_inserts_after_pipe() {
+        let updated = inject_flags("echo hi | planpilot step show-next", "/tmp", "abc");
+        assert!(
+            updated.contains("| planpilot --cwd /tmp --session-id abc step show-next"),
+            "command: {updated}"
+        );
+    }
+
+    #[test]
+    fn inject_flags_skips_quoted_planpilot() {
+        let command = "echo 'planpilot step show-next'";
+        let updated = inject_flags(command, "/tmp", "abc");
+        assert_eq!(updated, command);
     }
 
     #[test]
@@ -262,17 +380,17 @@ mod tests {
     fn inject_flags_escapes_parens_and_spaces() {
         let command = "planpilot plan add-tree \"Todolist backend (Rust/Axum/SeaORM)\" \"Build a plan\" --step \"{\\\"content\\\":\\\"Step A\\\"}\"";
         let updated = inject_flags(command, "/tmp", "abc");
-        assert!(updated.contains("'Todolist backend (Rust/Axum/SeaORM)'"));
-        assert!(updated.contains("'Build a plan'"));
-        assert!(updated.contains("'{\"content\":\"Step A\"}'"));
+        assert!(updated.contains("\"Todolist backend (Rust/Axum/SeaORM)\""));
+        assert!(updated.contains("\"Build a plan\""));
+        assert!(updated.contains("\"{\\\"content\\\":\\\"Step A\\\"}\""));
     }
 
     #[test]
     fn inject_flags_escapes_single_quotes() {
         let command = "planpilot plan add \"Bob's plan\" \"O'Reilly content\"";
         let updated = inject_flags(command, "/tmp", "abc");
-        assert!(updated.contains("'Bob'\\''s plan'"));
-        assert!(updated.contains("'O'\\''Reilly content'"));
+        assert!(updated.contains("\"Bob's plan\""));
+        assert!(updated.contains("\"O'Reilly content\""));
     }
 
     #[test]

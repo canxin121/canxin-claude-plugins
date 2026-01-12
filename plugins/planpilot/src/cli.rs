@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -103,23 +102,21 @@ pub struct PlanAdd {
 pub struct PlanAddTree {
     pub title: String,
     pub content: String,
-    #[arg(long = "step", value_name = "JSON", num_args = 1.., action = clap::ArgAction::Append)]
-    pub steps: Vec<StepSpec>,
+    #[arg(
+        value_name = "ARGS",
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Use --step <content> [--executor ai|human] [--goal <goal> ...] repeating per step"
+    )]
+    pub args: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct StepSpec {
     pub content: String,
     pub executor: Option<StepExecutorArg>,
     pub goals: Option<Vec<String>>,
-}
-
-impl FromStr for StepSpec {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(value).map_err(|err| err.to_string())
-    }
 }
 
 #[derive(Args, Debug)]
@@ -307,34 +304,20 @@ pub struct GoalUpdate {
 
 #[derive(Args, Debug)]
 pub struct PlanComment {
-    #[arg(long = "entry", value_name = "JSON", num_args = 1.., action = clap::ArgAction::Append)]
-    pub entries: Vec<CommentEntry>,
+    #[arg(value_name = "ARG", num_args = 2..)]
+    pub pairs: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct StepComment {
-    #[arg(long = "entry", value_name = "JSON", num_args = 1.., action = clap::ArgAction::Append)]
-    pub entries: Vec<CommentEntry>,
+    #[arg(value_name = "ARG", num_args = 2..)]
+    pub pairs: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct GoalComment {
-    #[arg(long = "entry", value_name = "JSON", num_args = 1.., action = clap::ArgAction::Append)]
-    pub entries: Vec<CommentEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CommentEntry {
-    pub id: i64,
-    pub comment: String,
-}
-
-impl FromStr for CommentEntry {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(value).map_err(|err| err.to_string())
-    }
+    #[arg(value_name = "ARG", num_args = 2..)]
+    pub pairs: Vec<String>,
 }
 
 #[derive(Args, Debug)]

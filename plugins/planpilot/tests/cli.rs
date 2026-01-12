@@ -150,10 +150,96 @@ fn hook_pretooluse_injects_flags() {
 }
 
 #[test]
+fn hook_pretooluse_injects_flags_after_cd_chain() {
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "cd /tmp&&planpilot step show-next"},
+        "session_id": "hook-session",
+        "cwd": "/tmp/project",
+        "permission_mode": "allow"
+    });
+    let output = run_cmd_with_env(
+        None,
+        None,
+        &["hook", "pretooluse"],
+        Some(&payload.to_string()),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let value: Value = serde_json::from_str(&stdout).expect("json output");
+    let command = value["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .expect("command");
+    assert!(
+        command.starts_with("cd /tmp&&planpilot --cwd /tmp/project --session-id hook-session"),
+        "command: {command}"
+    );
+}
+
+#[test]
+fn hook_pretooluse_injects_flags_after_pipe() {
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hi | planpilot step show-next"},
+        "session_id": "hook-session",
+        "cwd": "/tmp/project",
+        "permission_mode": "allow"
+    });
+    let output = run_cmd_with_env(
+        None,
+        None,
+        &["hook", "pretooluse"],
+        Some(&payload.to_string()),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let value: Value = serde_json::from_str(&stdout).expect("json output");
+    let command = value["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .expect("command");
+    assert!(
+        command.contains("| planpilot --cwd /tmp/project --session-id hook-session step show-next"),
+        "command: {command}"
+    );
+}
+
+#[test]
 fn hook_pretooluse_ignores_non_matching_command() {
     let payload = serde_json::json!({
         "tool_name": "Bash",
         "tool_input": {"command": "planpilot"},
+        "session_id": "hook-session",
+        "cwd": "/tmp/project",
+        "permission_mode": "allow"
+    });
+    let output = run_cmd_with_env(
+        None,
+        None,
+        &["hook", "pretooluse"],
+        Some(&payload.to_string()),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.trim().is_empty());
+}
+
+#[test]
+fn hook_pretooluse_ignores_quoted_planpilot() {
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo \"planpilot step show-next\""},
         "session_id": "hook-session",
         "cwd": "/tmp/project",
         "permission_mode": "allow"
@@ -325,9 +411,17 @@ fn plan_add_tree_creates_steps_and_goals() {
             "Tree Plan",
             "Plan content",
             "--step",
-            r#"{"content":"Step A","executor":"Ai","goals":["Goal A1","Goal A2"]}"#,
+            "Step A",
+            "--executor",
+            "ai",
+            "--goal",
+            "Goal A1",
+            "--goal",
+            "Goal A2",
             "--step",
-            r#"{"content":"Step B","executor":"Human"}"#,
+            "Step B",
+            "--executor",
+            "human",
         ],
         None,
     ));
@@ -345,20 +439,7 @@ fn plan_add_tree_creates_steps_and_goals() {
 }
 
 #[test]
-fn plan_add_tree_rejects_invalid_json_step() {
-    let dir = TempDir::new().expect("temp dir");
-    let output = run_cmd(
-        Some(dir.path()),
-        &["plan", "add-tree", "Plan", "Content", "--step", "not-json"],
-        None,
-    );
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.to_lowercase().contains("invalid") || stderr.contains("expected"));
-}
-
-#[test]
-fn plan_add_tree_rejects_empty_step_content() {
+fn plan_add_tree_rejects_json_step_spec() {
     let dir = TempDir::new().expect("temp dir");
     let output = run_cmd(
         Some(dir.path()),
@@ -368,13 +449,26 @@ fn plan_add_tree_rejects_empty_step_content() {
             "Plan",
             "Content",
             "--step",
-            r#"{"content":"   "}"#,
+            r#"{"content":"Step"}"#,
         ],
         None,
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("step content cannot be empty"));
+    assert!(stderr.contains("no longer accepts JSON"));
+}
+
+#[test]
+fn plan_add_tree_rejects_empty_step_content() {
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_cmd(
+        Some(dir.path()),
+        &["plan", "add-tree", "Plan", "Content", "--step", "   "],
+        None,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("plan add-tree --step cannot be empty"));
 }
 
 #[test]
@@ -388,7 +482,9 @@ fn plan_add_tree_rejects_empty_goal_content() {
             "Plan",
             "Content",
             "--step",
-            r#"{"content":"Step","goals":["   "]}"#,
+            "Step",
+            "--goal",
+            "   ",
         ],
         None,
     );
@@ -435,28 +531,12 @@ fn step_comment_rejects_empty_comment() {
     let step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
     let output = run_cmd(
         Some(dir.path()),
-        &[
-            "step",
-            "comment",
-            "--entry",
-            &format!(r#"{{"id":{step_id},"comment":"   "}}"#),
-        ],
+        &["step", "comment", &step_id.to_string(), "   "],
         None,
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("comment cannot be empty"));
-}
-
-#[test]
-fn step_comment_rejects_invalid_json_entry() {
-    let dir = TempDir::new().expect("temp dir");
-    let plan_id = create_plan(&dir);
-    let _step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
-    let output = run_cmd(Some(dir.path()), &["step", "comment", "--entry", "{"], None);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.to_lowercase().contains("invalid") || stderr.contains("expected"));
 }
 
 #[test]
@@ -490,29 +570,12 @@ fn goal_comment_rejects_empty_comment() {
     let goal_id = add_goal(&dir, step_id, "Goal 1");
     let output = run_cmd(
         Some(dir.path()),
-        &[
-            "goal",
-            "comment",
-            "--entry",
-            &format!(r#"{{"id":{goal_id},"comment":"   "}}"#),
-        ],
+        &["goal", "comment", &goal_id.to_string(), "   "],
         None,
     );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("comment cannot be empty"));
-}
-
-#[test]
-fn goal_comment_rejects_invalid_json_entry() {
-    let dir = TempDir::new().expect("temp dir");
-    let plan_id = create_plan(&dir);
-    let step_id = add_step(&dir, plan_id, "Step 1", Some("ai"));
-    let _goal_id = add_goal(&dir, step_id, "Goal 1");
-    let output = run_cmd(Some(dir.path()), &["goal", "comment", "--entry", "{"], None);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.to_lowercase().contains("invalid") || stderr.contains("expected"));
 }
 
 #[test]

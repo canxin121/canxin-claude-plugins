@@ -18,8 +18,8 @@ use crate::cli::{
     Cli, Command, GoalAdd, GoalCommand, GoalComment, GoalDone, GoalList, GoalRemove, GoalShow,
     GoalStatusArg, GoalUpdate, HookCommand, PlanActivate, PlanAdd, PlanAddTree, PlanCommand,
     PlanComment, PlanDone, PlanExport, PlanList, PlanOrderArg, PlanRemove, PlanShow, PlanStatusArg,
-    PlanUpdate, StepAdd, StepAddTree, StepCommand, StepComment, StepDone, StepExecutorArg,
-    StepList, StepMove, StepOrderArg, StepRemove, StepShow, StepStatusArg, StepUpdate,
+    PlanUpdate, StepAdd, StepAddTree, StepCommand, StepComment, StepDone, StepExecutorArg, StepList,
+    StepMove, StepOrderArg, StepRemove, StepShow, StepSpec, StepStatusArg, StepUpdate,
 };
 use crate::error::AppError;
 use crate::model::{
@@ -188,14 +188,15 @@ async fn handle_plan_add(app: &App, args: PlanAdd) -> Result<Vec<i64>, AppError>
 async fn handle_plan_add_tree(app: &App, args: PlanAddTree) -> Result<Vec<i64>, AppError> {
     require_non_empty("plan title", &args.title)?;
     require_non_empty("plan content", &args.content)?;
-    if args.steps.is_empty() {
+    let specs = parse_plan_add_tree_steps(&args.args)?;
+    if specs.is_empty() {
         return Err(AppError::InvalidInput(
-            "at least one --step is required".to_string(),
+            "plan add-tree requires at least one --step".to_string(),
         ));
     }
 
-    let mut steps = Vec::with_capacity(args.steps.len());
-    for spec in args.steps {
+    let mut steps = Vec::with_capacity(specs.len());
+    for spec in specs {
         require_non_empty("step content", &spec.content)?;
         let executor = spec
             .executor
@@ -300,16 +301,7 @@ async fn handle_plan_export(app: &App, args: PlanExport) -> Result<Vec<i64>, App
 }
 
 async fn handle_plan_comment(app: &App, args: PlanComment) -> Result<Vec<i64>, AppError> {
-    if args.entries.is_empty() {
-        return Err(AppError::InvalidInput(
-            "plan comment requires at least one --entry".to_string(),
-        ));
-    }
-    let mut entries = Vec::with_capacity(args.entries.len());
-    for entry in args.entries {
-        require_non_empty("comment", &entry.comment)?;
-        entries.push((entry.id, entry.comment));
-    }
+    let entries = parse_comment_pairs("plan", args.pairs)?;
     let plan_ids = app.comment_plans(entries).await?;
     if plan_ids.len() == 1 {
         println!("Updated plan comment for plan ID: {}.", plan_ids[0]);
@@ -556,16 +548,7 @@ async fn handle_step_update(app: &App, args: StepUpdate) -> Result<Vec<i64>, App
 }
 
 async fn handle_step_comment(app: &App, args: StepComment) -> Result<Vec<i64>, AppError> {
-    if args.entries.is_empty() {
-        return Err(AppError::InvalidInput(
-            "step comment requires at least one --entry".to_string(),
-        ));
-    }
-    let mut entries = Vec::with_capacity(args.entries.len());
-    for entry in args.entries {
-        require_non_empty("comment", &entry.comment)?;
-        entries.push((entry.id, entry.comment));
-    }
+    let entries = parse_comment_pairs("step", args.pairs)?;
     let plan_ids = app.comment_steps(entries).await?;
     if plan_ids.len() == 1 {
         println!("Updated step comments for plan ID: {}.", plan_ids[0]);
@@ -702,16 +685,7 @@ async fn handle_goal_update(app: &App, args: GoalUpdate) -> Result<Vec<i64>, App
 }
 
 async fn handle_goal_comment(app: &App, args: GoalComment) -> Result<Vec<i64>, AppError> {
-    if args.entries.is_empty() {
-        return Err(AppError::InvalidInput(
-            "goal comment requires at least one --entry".to_string(),
-        ));
-    }
-    let mut entries = Vec::with_capacity(args.entries.len());
-    for entry in args.entries {
-        require_non_empty("comment", &entry.comment)?;
-        entries.push((entry.id, entry.comment));
-    }
+    let entries = parse_comment_pairs("goal", args.pairs)?;
     let plan_ids = app.comment_goals(entries).await?;
     if plan_ids.len() == 1 {
         println!("Updated goal comments for plan ID: {}.", plan_ids[0]);
@@ -816,6 +790,169 @@ fn resolve_session_id(session_id: Option<String>) -> Result<String, AppError> {
         )));
     }
     Ok(trimmed.to_string())
+}
+
+#[derive(Debug)]
+struct StepSpecBuilder {
+    content: String,
+    executor: Option<StepExecutorArg>,
+    goals: Vec<String>,
+}
+
+impl StepSpecBuilder {
+    fn new(content: &str) -> Self {
+        Self {
+            content: content.to_string(),
+            executor: None,
+            goals: Vec::new(),
+        }
+    }
+
+    fn into_spec(self) -> StepSpec {
+        StepSpec {
+            content: self.content,
+            executor: self.executor,
+            goals: if self.goals.is_empty() {
+                None
+            } else {
+                Some(self.goals)
+            },
+        }
+    }
+}
+
+fn parse_plan_add_tree_steps(args: &[String]) -> Result<Vec<StepSpec>, AppError> {
+    if args.is_empty() {
+        return Err(AppError::InvalidInput(
+            "plan add-tree requires at least one --step".to_string(),
+        ));
+    }
+
+    let mut steps = Vec::new();
+    let mut current: Option<StepSpecBuilder> = None;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--" => {
+                idx += 1;
+            }
+            "--step" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    AppError::InvalidInput("plan add-tree --step requires a value".to_string())
+                })?;
+                if let Some(step) = current.take() {
+                    steps.push(step.into_spec());
+                }
+                let builder = parse_step_spec_value(value)?;
+                current = Some(builder);
+                idx += 2;
+            }
+            "--executor" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    AppError::InvalidInput("plan add-tree --executor requires a value".to_string())
+                })?;
+                let executor = parse_step_executor_arg(value)?;
+                match current.as_mut() {
+                    Some(step) => {
+                        step.executor = Some(executor);
+                    }
+                    None => {
+                        return Err(AppError::InvalidInput(
+                            "plan add-tree --executor must follow a --step".to_string(),
+                        ));
+                    }
+                }
+                idx += 2;
+            }
+            "--goal" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    AppError::InvalidInput("plan add-tree --goal requires a value".to_string())
+                })?;
+                match current.as_mut() {
+                    Some(step) => {
+                        step.goals.push(value.to_string());
+                    }
+                    None => {
+                        return Err(AppError::InvalidInput(
+                            "plan add-tree --goal must follow a --step".to_string(),
+                        ));
+                    }
+                }
+                idx += 2;
+            }
+            unexpected => {
+                return Err(AppError::InvalidInput(format!(
+                    "plan add-tree unexpected argument: {unexpected}"
+                )));
+            }
+        }
+    }
+
+    if let Some(step) = current.take() {
+        steps.push(step.into_spec());
+    }
+
+    if steps.is_empty() {
+        return Err(AppError::InvalidInput(
+            "plan add-tree requires at least one --step".to_string(),
+        ));
+    }
+
+    Ok(steps)
+}
+
+fn parse_step_executor_arg(value: &str) -> Result<StepExecutorArg, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ai" => Ok(StepExecutorArg::Ai),
+        "human" => Ok(StepExecutorArg::Human),
+        _ => Err(AppError::InvalidInput(format!(
+            "invalid executor '{value}', expected ai|human"
+        ))),
+    }
+}
+
+fn parse_step_spec_value(value: &str) -> Result<StepSpecBuilder, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidInput(
+            "plan add-tree --step cannot be empty".to_string(),
+        ));
+    }
+    if trimmed.starts_with('{') {
+        return Err(AppError::InvalidInput(
+            "plan add-tree no longer accepts JSON step specs; use --step <content> [--executor ai|human] [--goal <goal> ...]"
+                .to_string(),
+        ));
+    }
+    Ok(StepSpecBuilder::new(value))
+}
+
+fn parse_comment_pairs(kind: &str, pairs: Vec<String>) -> Result<Vec<(i64, String)>, AppError> {
+    if pairs.is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "{kind} comment requires <id> <comment> pairs"
+        )));
+    }
+
+    if pairs.len() % 2 != 0 {
+        return Err(AppError::InvalidInput(format!(
+            "{kind} comment expects <id> <comment> pairs"
+        )));
+    }
+
+    let mut parsed = Vec::with_capacity(pairs.len() / 2);
+    let mut iter = pairs.into_iter();
+    while let Some(id_value) = iter.next() {
+        let comment = iter.next().unwrap_or_default();
+        let id = id_value.parse::<i64>().map_err(|_| {
+            AppError::InvalidInput(format!("{kind} comment id '{id_value}' is invalid"))
+        })?;
+        require_non_empty("comment", &comment)?;
+        parsed.push((id, comment));
+    }
+
+    Ok(parsed)
 }
 
 fn plan_status_from_arg(arg: PlanStatusArg) -> PlanStatus {

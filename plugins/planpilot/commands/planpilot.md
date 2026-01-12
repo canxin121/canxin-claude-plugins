@@ -54,16 +54,25 @@ allowed-tools: ["Bash(planpilot:*)"]
 ## Commands
 
 ### plan
+- IMPORTANT: The AI must NOT pass `--cwd` or `--session-id` manually. These are auto-injected by the hook; passing them will conflict with the injected values.
 - `plan add <title> <content>`: create a plan.
   - Output: `Created plan ID: <id>: <title>`.
-- `plan add-tree <title> <content> --step <json> [--step <json> ...]`: create a plan with steps/goals in one command.
+- `plan add-tree <title> <content> --step <content> [--executor ai|human] [--goal <goal> ...] [--step <content> ...]`: create a plan with steps/goals in one command.
   - Output: `Created plan ID: <id>: <title> (steps: <n>, goals: <n>)`.
-  - Each `--step` takes a JSON object: `{ "content": "...", "executor": "Ai|Human", "goals": ["..."] }`.
+  - Repeatable groups: you can repeat the `--step ... [--executor ...] [--goal ...]` group multiple times.
+  - Each `--executor` / `--goal` applies to the most recent `--step`.
   - Example:
     ```bash
     planpilot plan add-tree "Release v1.2" "Plan description" \
-      --step '{"content":"Cut release branch","executor":"Human","goals":["Create branch","Tag base"]}' \
-      --step '{"content":"Build artifacts","executor":"Ai","goals":["Build packages"]}'
+      --step "Cut release branch" --executor human --goal "Create branch" --goal "Tag base" \
+      --step "Build artifacts" --executor ai --goal "Build packages"
+    ```
+  - Another example (3 steps, some without goals/executor):
+    ```bash
+    planpilot plan add-tree "Onboarding" "Setup plan" \
+      --step "Create accounts" --goal "GitHub" --goal "Slack" \
+      --step "Install tooling" --executor ai \
+      --step "Read handbook"
     ```
 - `plan list [--all] [--status todo|done] [--order id|title|created|updated] [--desc]`: list plans (defaults to `todo` unless `--all` or `--status` is set).
   - Output: prints a header line, then one line per plan with `ID STAT STEPS TITLE COMMENT` (`STEPS` is `done/total`); use `plan show` for full details.
@@ -80,10 +89,14 @@ allowed-tools: ["Bash(planpilot:*)"]
   - Output: `Plan ID: <id> marked done.`
   - Output (active plan): `Active plan deactivated because plan is done.`
   - Errors: multi-line `Error: Invalid input:` with `cannot mark plan done; next pending step:` on the next line, followed by the same step detail output as `step show`.
-- `plan comment --entry <json> [--entry <json> ...]`: add or replace comments for one or more plans.
-  - Each `--entry` takes a JSON object: `{ "id": 123, "comment": "..." }`.
+- `plan comment <id1> <comment1> [<id2> <comment2> ...]`: add or replace comments for one or more plans.
   - Output (single): `Updated plan comment for plan ID: <id>.`
   - Output (batch): `Updated plan comments for <n> plans.`
+  - Each plan comment uses an `<id> <comment>` pair; you can provide multiple pairs in one call.
+  - Example:
+    ```bash
+    planpilot plan comment 12 "high priority" 15 "waiting on input"
+    ```
 - `plan remove <id>`: remove plan (and its steps/goals).
   - Output: `Plan ID: <id> removed.`
 - `plan activate <id> [--force]`: set the active plan.
@@ -121,10 +134,14 @@ allowed-tools: ["Bash(planpilot:*)"]
 - `step update <id> [--content <content>] [--status todo|done] [--executor ai|human] [--comment <comment>]`: update fields; `--status done` is allowed only when all goals are done or the step has no goals.
   - Output: `Updated step ID: <id>.`.
   - Errors: `Error: Invalid input: cannot mark step done; next pending goal: <content> (id <id>)`.
-- `step comment --entry <json> [--entry <json> ...]`: add or replace comments for one or more steps.
-  - Each `--entry` takes a JSON object: `{ "id": 456, "comment": "..." }`.
+- `step comment <id1> <comment1> [<id2> <comment2> ...]`: add or replace comments for one or more steps.
   - Output (single): `Updated step comments for plan ID: <plan_id>.`
   - Output (batch): `Updated step comments for <n> plans.`
+  - Each step comment uses an `<id> <comment>` pair; you can provide multiple pairs in one call.
+  - Example:
+    ```bash
+    planpilot step comment 45 "blocked by API" 46 "ready to start"
+    ```
 - `step done <id> [--all-goals]`: mark step done (same rule as `step update --status done`). Use `--all-goals` to mark all goals in the step done first, then mark the step done.
   - Output: `Step ID: <id> marked done.`
   - Errors: `Error: Invalid input: cannot mark step done; next pending goal: <content> (id <id>)`.
@@ -145,10 +162,14 @@ allowed-tools: ["Bash(planpilot:*)"]
   - Output (empty): `No goals found for step ID: <step_id>.`
 - `goal update <id> [--content <content>] [--status todo|done] [--comment <comment>]`: update fields.
   - Output: `Updated goal <id>.`
-- `goal comment --entry <json> [--entry <json> ...]`: add or replace comments for one or more goals.
-  - Each `--entry` takes a JSON object: `{ "id": 789, "comment": "..." }`.
+- `goal comment <id1> <comment1> [<id2> <comment2> ...]`: add or replace comments for one or more goals.
   - Output (single): `Updated goal comments for plan ID: <plan_id>.`
   - Output (batch): `Updated goal comments for <n> plans.`
+  - Each goal comment uses an `<id> <comment>` pair; you can provide multiple pairs in one call.
+  - Example:
+    ```bash
+    planpilot goal comment 78 "done" 81 "needs review"
+    ```
 - `goal done <id1> [<id2> ...]`: mark one or more goals done.
   - Output (single): `Goal ID: <id> marked done.`
   - Output (batch): `Goals marked done: <n>.`
